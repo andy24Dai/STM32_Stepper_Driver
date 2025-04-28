@@ -36,7 +36,7 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define USB_BUF_LEN 128
-#define UPDATE_PROFILE_PERIOD 5
+#define UPDATE_PROFILE_PERIOD 1
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -58,11 +58,11 @@ uint8_t rx_flag = 0;
 float target_setpoints[3];
 float current_setpoints[3];
 
-float TICK_PERIOD = 0.000015625; // tick/s
+float TICK_PERIOD = 0.000015625; // s/tick
 
 float position_kP = 0.00024;
 float MOTOR_MAX_SPEED = 0.3; // steps/tick
-float MOTOR_MAX_ACCEL = 1.2; // steps/tick/s
+float MOTOR_MAX_ACCEL = 1.6; // steps/tick/s
 
 float MOTOR_MAX_ANGLE = 70.; // degrees
 float MOTOR_MIN_ANGLE = -30; // degrees
@@ -107,11 +107,11 @@ float Heaviside(float num){
 
 typedef struct{
 	float accel; // steps/tick/ms
-	float speed_cruise;
+	float velocity_cruise;
 	int steps_curr;
 	int steps_total;
 	int steps_accel;
-	int steps_deccel;
+	int steps_decel;
 } TrapProfile ;
 
 TrapProfile CreateTrapProfileDefault(){
@@ -124,7 +124,7 @@ typedef struct {
 	uint16_t step_pin;
 	uint16_t dir_pin;
 	float step_accum;
-	float speed_current;
+	float velocity_current;
 	int direction;
 	int position_current;
 	int position_target;
@@ -158,7 +158,7 @@ void Update_Profiles(int steps1, int steps2, int steps3);
 
 // UTIL
 
-void Generate_Profile(StepperMotor* motor, int error, float speed, float accel);
+void Generate_Profile(StepperMotor* motor, float error, float speed, float accel);
 int Degrees_to_Steps(float angle);
 float Steps_to_Degrees(int steps);
 
@@ -204,9 +204,13 @@ int main(void)
   profile2 = CreateTrapProfileDefault();
   profile3 = CreateTrapProfileDefault();
 
-  motor1 = CreateMotorDefault(GPIOA, GPIOA, GPIO_PIN_9, GPIO_PIN_10, &profile1);
-  motor2 = CreateMotorDefault(GPIOA, GPIOB, GPIO_PIN_15, GPIO_PIN_3, &profile2);
-  motor3 = CreateMotorDefault(GPIOB, GPIOB, GPIO_PIN_4, GPIO_PIN_5, &profile3);
+//  motor1 = CreateMotorDefault(GPIOA, GPIOA, GPIO_PIN_9, GPIO_PIN_10, &profile1);
+//  motor2 = CreateMotorDefault(GPIOA, GPIOB, GPIO_PIN_15, GPIO_PIN_3, &profile2);
+//  motor3 = CreateMotorDefault(GPIOB, GPIOB, GPIO_PIN_4, GPIO_PIN_5, &profile3);
+
+  motor1 = CreateMotorDefault(GPIOA, GPIOA, 9, 10, &profile1);
+  motor2 = CreateMotorDefault(GPIOA, GPIOB, 15, 3, &profile2);
+  motor3 = CreateMotorDefault(GPIOB, GPIOB, 4, 5, &profile3);
 
   uint32_t currTime = 0;
   uint32_t prevTimeStepUpdate = 0;
@@ -216,6 +220,11 @@ int main(void)
   motor1.position_current = Degrees_to_Steps(-34);
   motor2.position_current = Degrees_to_Steps(-34);
   motor3.position_current = Degrees_to_Steps(-34);
+
+  motor1.position_target = Degrees_to_Steps(-34);
+  motor2.position_target = Degrees_to_Steps(-34);
+  motor3.position_target = Degrees_to_Steps(-34);
+
 
   /* USER CODE END 2 */
 
@@ -258,12 +267,24 @@ int main(void)
 	}
 
 	if(currTime - prevTimeTransmit > 17){
-		usb_tx_buf_len = snprintf((char*) usb_tx_buffer, USB_BUF_LEN, "%f %f %d\r\n",
-				motor1.speed_current,
+		if(motor1.position_current != motor1.position_target){
+		usb_tx_buf_len = snprintf((char*) usb_tx_buffer, USB_BUF_LEN,
+				"vi %f a %f ad %f vc %f pc %f pt %f %d %d %d %d \r\n",
+				motor1.velocity_current,
+				motor1.profile->accel,
+				(motor1.velocity_current*motor1.velocity_current)/
+				(2.0f*((float)(motor1.profile->steps_total - motor1.profile->steps_curr)))/
+				(1000.f*TICK_PERIOD),
+				motor1.profile->velocity_cruise,
 				Steps_to_Degrees(motor1.position_current),
-				motor1.profile->steps_deccel);
+				Steps_to_Degrees(motor1.position_target),
+				motor1.profile->steps_accel,
+				motor1.profile->steps_decel,
+				motor1.profile->steps_curr,
+				motor1.profile->steps_total);
 		CDC_Transmit_FS(usb_tx_buffer, usb_tx_buf_len);
 
+		}
 		prevTimeTransmit = currTime;
 	}
 
@@ -426,7 +447,6 @@ static void MX_GPIO_Init(void)
 
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim){
 
-
 	static uint8_t step_flag_1;
 	static uint8_t step_flag_2;
 	static uint8_t step_flag_3;
@@ -440,11 +460,20 @@ void Step_Motor(StepperMotor* motor, uint8_t* flag){
 
 	if(motor->position_current != motor->position_target){
 
-		motor->step_accum += motor->speed_current;
+		motor->step_accum += fabsf(motor->velocity_current);
+
+		if(motor->velocity_current > 0){
+			motor->dir_port->BSRR = (1 << motor->dir_pin);
+			motor->direction = 1;
+		}
+		else{
+			motor->dir_port->BSRR = (1 << (motor->dir_pin+16));
+			motor->direction = 0;
+		}
 
 		if(motor->step_accum < 1.0f){
 			if(*flag){
-				HAL_GPIO_WritePin(motor->step_port, motor->step_pin, 0);
+				motor->step_port->BSRR = (1 << (motor->step_pin+16));
 				*flag = 0;
 			}
 		}
@@ -452,7 +481,7 @@ void Step_Motor(StepperMotor* motor, uint8_t* flag){
 		else{
 			motor->step_accum -= 1.0f;
 			*flag = 1;
-			HAL_GPIO_WritePin(motor->step_port, motor->step_pin, 1);
+			motor->step_port->BSRR = (1 << (motor->step_pin));
 
 			if(motor->direction){
 				motor->position_current++;
@@ -464,8 +493,8 @@ void Step_Motor(StepperMotor* motor, uint8_t* flag){
 			motor->profile->steps_curr++;
 
 			if(motor->position_current == motor->position_target){
-				  HAL_GPIO_WritePin(motor->step_port, motor->step_pin, 0);
-				  *flag = 0;
+				 motor->step_port->BSRR = (1 << (motor->step_pin+16));
+				 *flag = 0;
 			}
 		}
 	}
@@ -474,9 +503,6 @@ void Step_Motor(StepperMotor* motor, uint8_t* flag){
 
 void Update_Stepper(StepperMotor* motor, int new_target){
 	motor->position_target = new_target;
-	int dir = motor->position_target > motor->position_current;
-	motor->direction = dir;
-	HAL_GPIO_WritePin(motor->dir_port, motor->dir_pin, dir);
 
 }
 
@@ -487,19 +513,43 @@ void Update_Stepper_Degrees(StepperMotor* motor, float new_target){
 }
 
 void Update_Stepper_Speed(StepperMotor* motor){
-	if(motor->profile->steps_curr <= motor->profile->steps_accel){
-		motor->speed_current += motor->profile->accel * (float) UPDATE_PROFILE_PERIOD;
+
+	if (motor->position_current == motor->position_target) {
+		motor->velocity_current = 0;
+		return;
 	}
 
-	else if(motor->profile->steps_curr >= motor->profile->steps_total - motor->profile->steps_deccel){
-		float new_speed = fmaxf(motor->speed_current - motor->profile->accel * (float) UPDATE_PROFILE_PERIOD, 0);
-		motor->speed_current = new_speed;
+	float accelDir = ((motor->profile->velocity_cruise - motor->velocity_current) > 0) ? 1. : -1.;
+
+	if(motor->profile->steps_curr > motor->profile->steps_total){
+		motor->velocity_current = 0;
+		motor->position_target = motor->position_current;
 	}
 
+	// if motor is accelerating
+	else if(motor->profile->steps_curr <= motor->profile->steps_accel){
+		motor->velocity_current += motor->profile->accel * (float) UPDATE_PROFILE_PERIOD;
+	}
+
+	// if motor is decelerating
+	else if(motor->profile->steps_curr >= motor->profile->steps_total - motor->profile->steps_decel){
+		float dir = (motor->velocity_current > 0) ? 1.f : -1.f;
+		float steps_extra = (fabsf(motor->velocity_current)*(float)UPDATE_PROFILE_PERIOD)/(1000.f*TICK_PERIOD);
+		float steps_remaining = (float)(motor->profile->steps_total - motor->profile->steps_curr - (int)steps_extra) ;
+		float new_accel = (motor->velocity_current*motor->velocity_current)/(2.0f*steps_remaining);
+		new_accel = new_accel/(1000.f*TICK_PERIOD); //convert to steps/tick/ms
+
+		float new_velocity = motor->velocity_current - dir * new_accel * (float) UPDATE_PROFILE_PERIOD;
+		if((new_velocity * motor->profile->velocity_cruise) < 0.0f){
+			new_velocity = 0.0f;
+		}
+		motor->velocity_current = new_velocity;
+	}
+
+	// motor is cruising
 	else{
-		motor->speed_current = motor->profile->speed_cruise;
+		motor->velocity_current = motor->profile->velocity_cruise;
 	}
-
 }
 
 
@@ -524,11 +574,11 @@ void Update_Positions(float ang1, float ang2, float ang3){
 
 void Update_Profiles(int steps1, int steps2, int steps3){
 
-	float err1 = (float) abs(steps1 - motor1.position_current);
-	float err2 = (float) abs(steps2 - motor2.position_current);
-	float err3 = (float) abs(steps3 - motor3.position_current);
+	float err1 = (float) (steps1 - motor1.position_current);
+	float err2 = (float) (steps2 - motor2.position_current);
+	float err3 = (float) (steps3 - motor3.position_current);
 
-	float maxErr = fmaxf(fmaxf(err1, err2), err3);
+	float maxErr = fmaxf(fmaxf(fabsf(err1), fabsf(err2)), fabsf(err3));
 	float maxSpeed = fminf((MOTOR_MAX_SPEED/(MOTOR_MAX_ANGLE - MOTOR_MIN_ANGLE)) * maxErr, MOTOR_MAX_SPEED) + 0.01;
 
 	if(maxErr > 0){
@@ -539,26 +589,49 @@ void Update_Profiles(int steps1, int steps2, int steps3){
 
 }
 
-void Generate_Profile(StepperMotor* motor, int error, float max_speed, float new_accel){
-	motor->profile->accel = new_accel/1000.f;
-	motor->profile->speed_cruise = max_speed;
+void Generate_Profile(StepperMotor* motor, float error, float cruise_velocity, float new_accel){
+	motor->profile->accel = new_accel/1000.f; // steps/tick/ms
+	motor->profile->velocity_cruise = cruise_velocity;
 	motor->profile->steps_curr = 0;
-	motor->profile->steps_total = error;
 
-	float curr_speed = motor->speed_current;
-	float accel_ticks = new_accel*TICK_PERIOD;
+	float curr_velocity = motor->velocity_current;
+	float accel_ticks = fabsf(new_accel*TICK_PERIOD); //steps/tick^2
 
-	int steps_accel = (int)((max_speed*max_speed - curr_speed*curr_speed)/(2.f*accel_ticks));
-	int steps_deccel = (int)((-max_speed*max_speed)/(-2.f*accel_ticks));
+	int errorInt = abs((int) error);
 
-	if(steps_accel + steps_deccel > error){
-		steps_accel = (int)(((float) error )/2.f - (curr_speed*curr_speed)/(4.f*accel_ticks));
-		steps_deccel = error - steps_accel;
+	int steps_accel;
+	int steps_deccel;
+
+
+	//TODO add extra steps based on direction
+	if(1){//(curr_velocity*cruise_velocity) > 0){ // if velocities in same direction
+		motor->profile->steps_total = errorInt;
+		steps_accel = (int)((cruise_velocity*cruise_velocity - curr_velocity*curr_velocity)/(2.f*accel_ticks));
+		steps_deccel = (int)((cruise_velocity*cruise_velocity)/(2.f*accel_ticks));
+
+		if(steps_accel + steps_deccel > errorInt){
+			steps_accel = (int)((fabsf(error)/2.f) - ((curr_velocity*curr_velocity)/(4.f*accel_ticks)));
+			steps_deccel = errorInt - steps_accel;
+		}
+	}
+	else{
+//		int steps_zero = (int)((curr_velocity*curr_velocity)/(2.f*accel_ticks));
+//		steps_accel = (int)((cruise_velocity*cruise_velocity)/(2.f*accel_ticks));
+//		steps_deccel = steps_accel;//(int)((cruise_velocity*cruise_velocity)/(2.f*accel_ticks));
+//
+//		if(steps_accel + steps_deccel > errorInt){
+//			steps_accel = (int)(((float) fabsf(error) )/2.f - (curr_velocity*curr_velocity)/(4.f*accel_ticks));
+//			steps_deccel = errorInt - steps_accel;
+//		}
+//
+//		steps_accel += steps_zero;
+//
+//		motor->profile->steps_total = errorInt + steps_zero;
+
 	}
 
-	motor->profile->steps_accel = steps_accel;
-	motor->profile->steps_deccel = steps_deccel;
-
+	motor->profile->steps_accel = abs(steps_accel);
+	motor->profile->steps_decel = abs(steps_deccel);
 }
 
 int Degrees_to_Steps(float angle){
